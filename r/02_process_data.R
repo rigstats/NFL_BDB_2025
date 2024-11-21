@@ -7,44 +7,6 @@
 source('./r/01_load_data.R')
 
 
-# Plays ####
-
-plays_adj <- 
-   tracking %>% 
-   distinct(gameId, playId, playDirection) %>% 
-   
-   # join `playDirection` column from `tracking` df to create/correct yardline columns 
-   left_join(plays, by = join_by(gameId, playId)) %>% 
-   
-   # version of `yardlineNumber` but on a 1-100 yardline scale instead of 1-50
-   mutate(yardline_100 = ifelse(playDirection == 'right', 
-                                absoluteYardlineNumber - 10, 
-                                110 - absoluteYardlineNumber)) %>% 
-   
-   # yardline of first-down marker
-   mutate(yardline_fDown = yardline_100 + yardsToGo) %>% 
-   
-   # corrected version of column to adjust for left-facing plays
-   mutate(absoluteYardlineNumber = yardline_100 + 10) %>% 
-   
-   # convert to binary
-   mutate(playNullifiedByPenalty = ifelse(playNullifiedByPenalty == 'Y', 1L, 0L)) %>% 
-   
-   # drop unused / irrelevant columns
-   select(-yardlineNumber, -yardlineSide, -gameClock) %>% 
-   
-   # clean names of others
-   rename(xpass = passProbability,
-          wp_home = preSnapHomeTeamWinProbability,
-          wp_away = preSnapVisitorTeamWinProbability,
-          wpa_home = homeTeamWinProbabilityAdded,
-          wpa_away = visitorTeamWinProbilityAdded,
-          ep = expectedPoints,
-          epa = expectedPointsAdded)
-
-
-#relocate(yardline_100, yardline_fDown, absoluteYardlineNumber, yardsToGo, yardlineNumber, possessionTeam, yardlineSide, .after = playDirection)
-
 
 # Games ####
 
@@ -53,13 +15,12 @@ games_adj <-
    games %>% 
    
    # drop unused / irrelevant columns
-   select(-season, -gameDate, -gameTimeEastern) %>% 
+   select(-season, -gameDate, -gameTimeEastern, 
+          -homeFinalScore, -visitorFinalScore) %>% 
    
    # clean names of others
-   rename(home = homeTeamAbbr,
-          away = visitorTeamAbbr,
-          homeScore = homeFinalScore,
-          awayScore = visitorFinalScore) %>% 
+   rename(homeTeam = homeTeamAbbr,
+          awayTeam = visitorTeamAbbr) %>% 
    
    # rearrange, sort 
    relocate(week) %>% 
@@ -67,34 +28,125 @@ games_adj <-
    arrange(week, gameId)
 
 
+# Plays ####
+
+plays_adj <-
+   plays %>%
+   arrange(gameId, playId) %>%
+   left_join(games_adj, by = "gameId") %>%
+   # add flags as helper variables
+   mutate(isHomeTeam = as.integer(possessionTeam == homeTeam),
+          isHomeTeamDef = as.integer(defensiveTeam == homeTeam)) %>%
+   # replace "home_" values with values for possession team, then
+   # repeat process for defending team
+   mutate(score = ifelse(isHomeTeam, preSnapHomeScore, preSnapVisitorScore),
+          wp = ifelse(isHomeTeam, preSnapHomeTeamWinProbability, preSnapVisitorTeamWinProbability),
+          wpa = ifelse(isHomeTeam, homeTeamWinProbabilityAdded, visitorTeamWinProbilityAdded),
+          scoreDef = ifelse(isHomeTeamDef, preSnapHomeScore, preSnapVisitorScore)
+          # ,preSnapWPDef = ifelse(isHomeTeamDef, preSnapHomeTeamWinProbability, preSnapVisitorTeamWinProbability)
+          # ,WPADef = ifelse(isHomeTeamDef, homeTeamWinProbabilityAdded, visitorTeamWinProbilityAdded)
+          ) %>%
+   mutate(scoreDiff = score - scoreDef) %>%
+   # clean up final columns
+   relocate(isHomeTeam, score, wp, wpa,
+            scoreDef, scoreDiff, 
+            .after = defensiveTeam) %>%
+   select(-preSnapHomeScore,
+          -preSnapVisitorScore,
+          -preSnapHomeTeamWinProbability,
+          -preSnapVisitorTeamWinProbability,
+          -homeTeamWinProbabilityAdded,
+          -visitorTeamWinProbilityAdded,
+          -isHomeTeamDef,
+          -homeTeam,
+          -awayTeam) %>%
+   rename(ep = expectedPoints,
+          epa = expectedPointsAdded) |> 
+   # join in the playDirection variable from tracking df
+   # left_join(tracking %>% distinct(gameId, playId, playDirection),
+   #           by = join_by(gameId, playId)) |> 
+   dplyr::mutate(yardlineNumber_adj = 
+                    case_when(yardlineSide == possessionTeam ~ yardlineNumber,
+                              yardlineSide == defensiveTeam ~ 100 - yardlineNumber,
+                              TRUE ~ yardlineNumber)) |> 
+   dplyr::mutate(absoluteYardlineNumber = 
+                    case_when(yardlineNumber == yardlineNumber_adj ~ absoluteYardlineNumber,
+                              TRUE ~ yardlineNumber_adj + 10)) |> 
+   dplyr::mutate(yardlineFirstDown = yardlineNumber_adj + yardsToGo,
+                 absoluteFirstDownYardline = absoluteYardlineNumber + yardsToGo) |> 
+   dplyr::mutate(gameClock = 
+                    stringr::str_trunc(as.character(gameClock),
+                                       width = 5,
+                                       side = "right",
+                                       ellipsis = "")) |> 
+   mutate(ownTerritory = as.integer(yardlineNumber_adj <= 50)) |> 
+   select(-yardlineNumber) |> 
+   rename(yardlineNumber = yardlineNumber_adj) |> 
+   mutate(playDirectionRight = case_when(absoluteYardlineNumber <= 60 & ownTerritory == 1 ~ 1,
+                                         absoluteYardlineNumber > 60 & ownTerritory == 0 ~ 1,
+                                         TRUE ~ 0)) |> 
+   mutate(targetX = round(ifelse(playDirectionRight, targetX, 120 - targetX), digits = 1),
+          targetY = round(ifelse(playDirectionRight, targetY, (160/3) - targetY), digits = 1)) |> 
+   mutate(absoluteYardlineNumber = ifelse(playDirectionRight, 
+                                          absoluteYardlineNumber, 
+                                          yardlineNumber + 10))
+
+
+
+#relocate(yardline_100, yardline_fDown, absoluteYardlineNumber, yardsToGo, yardlineNumber, possessionTeam, yardlineSide, .after = playDirection)
+
+
+
+
 # Players ####
 
 # drop unused / irrelevant columns, 
 # create columns to group positions,
 # add identifiers for duplicated players (mult. teams, numbers, etc.)
-players_adj <- 
-   players %>% 
-   mutate(positionGroup = 
-             case_when(position %in% c('CB', 'DB', 'FS', 'SS') ~ 'DB',
-                       position %in% c('OLB', 'DT', 'DE', 'NT') ~ 'DL',
-                       position %in% c('T', 'G', 'C', 'LS') ~ 'OL',
-                       position %in% c('ILB', 'MLB') ~ 'LB',
-                       position %in% c('RB', 'FB') ~ 'RB',
-                       position %in% c('WR', 'TE', 'QB') ~ position,
-                       TRUE ~ 'ERR')) %>% 
-   mutate(isOffense = case_when(positionGroup %in% c('DB', 'DL', 'LB') ~ 0,
-                                positionGroup %in% c('OL', 'RB', 'WR', 'TE', 'QB') ~ 1,
-                                TRUE ~ NA_real_)) %>% 
-   inner_join(tracking %>% distinct(nflId, gameId, club, jerseyNumber)) %>% 
-   inner_join(games_adj %>% distinct(gameId, week)) %>% 
-   group_by(nflId, club, jerseyNumber, position, positionGroup, isOffense, displayName) %>% 
-   summarise(n_games = n(),
-             week_from = min(week),
-             week_to = max(week)) %>% 
-   ungroup() %>% 
-   add_count(nflId, name = "n_occs") %>% 
-   #filter(n > 1) %>% 
-   arrange(nflId, week_from)
+players_adj <-
+   players %>%
+   # add in categories/groups for the various positions
+   mutate(position_group = case_match(position,
+                                      c("NT","DT","DE","OLB") ~ "DL",
+                                      c("T","G","C") ~ "OL",
+                                      c("LB","MLB","ILB") ~ "LB",
+                                      c("CB","DB","SS","FS") ~ "DB",
+                                      c("RB","FB") ~ "RB",
+                                      .default = position)) %>%
+   # split into offensive vs defensive positions
+   mutate(position_side = case_match(position_group,
+                                     c("DL","LB","DB") ~ "DEF",
+                                     c("OL","RB","TE","QB","WR") ~ "OFF")) %>%
+   # parse out the feet and inches from the original `height` column
+   mutate(height_ft = stringr::str_split_fixed(string = height,
+                                               pattern = "-",
+                                               n = 2)[,1],
+          height_in = stringr::str_split_fixed(string = height,
+                                               pattern = "-",
+                                               n = 2)[,2]) %>%
+   # convert height to numeric value in inches
+   mutate(height_num = (as.numeric(height_ft) * 12) + as.numeric(height_in)) %>%
+   # extract age in years from `birthDate`
+   mutate(age = as.numeric((Sys.Date() - as.Date(birthDate)) / 365.25)) %>%
+   mutate(age_yr = round(age, digits = 0)) %>%
+   # clean up final columns
+   arrange(position_side, position_group, position, nflId, height_num, weight) %>%
+   select(posSide = position_side,
+          posGroup = position_group,
+          position,
+          nflId,
+          displayName,
+          height_in = height_num,
+          weight_lb = weight,
+          age_yr)
+
+# add in a row for the ball to assist with joins to tracking data
+players_adj <-
+   rbind(list('OFF', 'football', 'football', 0L, 'football', 1L, 1L, 1L),
+         players_adj)
+
+readr::write_csv(players_adj, file = "./input/mod/players_adj.csv")
+
 
 
 # Tracking ####

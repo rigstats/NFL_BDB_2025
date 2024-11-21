@@ -14,6 +14,8 @@ library(gganimate)
 
 # Data ####
 
+## Raw BDB datasets ----
+
 # non-tracking data
 games <- readr::read_csv('./input/games.csv')
 players <- readr::read_csv('./input/players.csv')
@@ -23,12 +25,10 @@ player_play <- readr::read_csv('./input/player_play.csv')
 
 # tracking data
 
-# check to see if processed version already exists
-# if yes, then read in the file. If not, then run loop to create it
-
-if (file.exists('./data/tracking.rds')) {
+# read in processed version if exists, create it if it doesn't
+if (file.exists('./input/tracking_union_mod.rds')) {
    
-   tracking <- readRDS('./data/tracking.rds')
+   tracking <- readRDS('./input/tracking_union_mod.rds')
    
 } else {
    
@@ -58,14 +58,83 @@ if (file.exists('./data/tracking.rds')) {
    tracking <- data.table::rbindlist(tracking_list) %>% tibble()
    
    # save results for future loading
-   saveRDS(tracking, './data/tracking.rds')
+   saveRDS(tracking, './input/tracking_union_mod.rds')
    #readr::write_csv(tracking, file = './data/tracking.csv')
    
    # if successful, remove the loop's temp objects from environment
-   if (file.exists('./data/tracking.rds') & nrow(tracking == 59327373)) {
-      
-      rm(list = c('tracking_files', 'tracking_list', 'i'))
-      
-   }
+   # if (file.exists('./data/tracking.rds') & nrow(tracking == 59327373)) {
+   #    
+   #    rm(list = c('tracking_files', 'tracking_list', 'i'))
+   #    
+   # }
    
 }
+
+
+## nflverse datasets
+
+if (file.exists('./input/nflverse_joined.rds')) {
+   
+   nflverse_joined <- readRDS('./input/nflverse_joined.rds')
+   
+} else {
+   
+   nflv_participation <-
+      nflreadr::load_participation(seasons = 2022) |> 
+      tibble()
+   
+   nflv_ftn <-
+      nflreadr::load_ftn_charting(seasons = 2022) |> 
+      filter(week <= 9) |> 
+      tibble()
+   
+   nflv_pbp <-
+      nflreadr::load_pbp(seasons = 2022) |>
+      filter(week <= 9) |> 
+      tibble()
+   
+   nflverse_joined <-
+      nflv_ftn |> 
+      rename(play_id = nflverse_play_id) |> 
+      select(-ftn_game_id, -ftn_play_id, -date_pulled, -season) |>
+      inner_join(nflv_participation, 
+                 by = join_by(nflverse_game_id, play_id)) |>
+      inner_join(nflv_pbp |> 
+                    select(nflverse_game_id = game_id, 
+                           old_game_id, 
+                           play_id,
+                           play_type, pass, rush,
+                           pass_length, pass_location, air_yards,
+                           run_location, run_gap,
+                           posteam, defteam,
+                           success, yardline_100,
+                           posteam_score, defteam_score, score_differential,
+                           xpass, pass_oe, cp, cpoe,
+                           game_half, 
+                           game_seconds_remaining, half_seconds_remaining,
+                           posteam_timeouts_remaining, 
+                           defteam_timeouts_remaining,
+                           wp, wpa),
+                 by = join_by(old_game_id, nflverse_game_id, play_id)) |> 
+      relocate(week, old_game_id, nflverse_game_id, play_id)
+   
+   saveRDS(nflverse_joined, "./input/nflverse_joined.rds")
+   # readr::write_csv(nflv_join, "./input/nflverse_joined.csv")
+   
+}
+
+
+
+
+nflv_colors <- 
+   nflreadr::load_teams() |> 
+   select(club = team_abbr,
+          color1 = team_color,
+          color2 = team_color2,
+          color3 = team_color3) |> 
+   rbind.data.frame(c("football","#000000","#000000","#000000")) |> 
+   mutate(across(.fns = function(x) tidyr::replace_na(x, replace = "#000000")))
+
+
+# saveRDS(nflv_colors, "./input/nflverse_colors.rds")
+# readr::write_csv(nflv_join, "./input/nflverse_joined.csv")
