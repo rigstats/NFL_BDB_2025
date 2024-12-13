@@ -1,0 +1,223 @@
+---
+title: "Expanding the xpass Model with Play-Calling Sequences and Tracking Data"
+output: html_notebook
+---
+
+# Purpose
+
+To expand the pre-existing model for Expected Dropback (`xPass`) to better
+detect patterns in offensive play-calling by adding in additional features
+at varying levels-of-detail (LODs):
+
+-   the static context of the individual play: personnel, formation, etc.
+-   the cumulative history up to this point in the game (and possibly
+    season): pass-rush splits, success rates, etc.
+-   the pre-snap, frame-by-frame coordinates of players from the tracking
+    data
+
+# Setup
+
+## Libraries
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+```
+
+## Data
+
+### Raw Input
+
+```{r message=FALSE, warning=FALSE}
+# non-tracking data
+games <- readr::read_csv('./input/games.csv')
+players <- readr::read_csv('./input/players.csv')
+plays <- readr::read_csv('./input/plays.csv')
+player_play <- readr::read_csv('./input/player_play.csv')
+
+# nflverse data
+nflverse_joined <- readr::read_tsv("./input/nflverse_joined.tsv")
+```
+
+```{r}
+# tracking data - week 1 only at first
+gameId_week_01 <- games |> filter(week == 1) |> pull(gameId)
+
+tracking <- 
+   arrow::read_parquet("./input/tracking_union_mod.parquet") |> 
+   filter(gameId %in% gameId_week_01)
+```
+
+```{r}
+head(tracking)
+```
+
+Trim the tracking data for smaller memory footprint
+
+```{r}
+tracking$playDirection <- NULL
+tracking$frameType <- NULL
+```
+
+```{r}
+# presnap frames only
+tracking <- tracking |> filter(frameTypeInt < 1)
+```
+
+```{r}
+# only keep plays that have a "line_set" event, then only keep frames between 
+# line_set and the snap
+tracking <- 
+   tracking |> 
+   group_by(gameId, playId) |> 
+   filter(sum(event == "line_set", na.rm = T) != 0, 
+          sum(event %in% c("ball_snap", "snap_direct"), na.rm = T) != 0) |> 
+   mutate(frameIdLineSet = min(frameId[event == "line_set"], na.rm = T)) |> 
+   ungroup() |> 
+   filter(frameId >= frameIdLineSet) |> 
+   select(-frameIdLineSet) |> 
+   arrange(gameId, playId, club, nflId, frameId)
+```
+
+## Functions
+
+```{r}
+# basic euclidean distance
+calculate_distance <- 
+   
+   function(x1, x2, y1, y2) { 
+      
+      dx = x1 - x2
+      
+      dy = y1 - y2
+      
+      sqrt(dx^2 + dy^2)
+      
+   }
+```
+
+```{r}
+# ranks coordinates based on distance from the center point
+# with additional filtering for minimum x and y distances
+rank_coordinates <- 
+   
+   function(coordinates, center, min_x_distance = 0, min_y_distance = 0) {
+      
+      # Validate input
+      if (nrow(coordinates) == 0) {
+         
+         stop("Coordinates dataframe is empty")
+         
+      }
+      
+      # Compute absolute distances from the center point
+      coordinates$x_distance <- abs(coordinates$x - center$x)
+      coordinates$y_distance <- abs(coordinates$y - center$y)
+      
+      # Filter coordinates based on minimum distance thresholds
+      filtered_coords <- 
+         coordinates[
+            coordinates$x_distance >= min_x_distance & 
+               coordinates$y_distance >= min_y_distance, 
+         ]
+      
+      # If no coordinates meet the distance criteria, return an empty dataframe
+      if (nrow(filtered_coords) == 0) {
+         
+         warning("No coordinates meet the minimum distance criteria")
+         return(data.frame())
+         
+      }
+      
+      # Sort by y_distance in descending order to rank from outside-in
+      ranked_coords <- 
+         filtered_coords[
+            order(filtered_coords$y_distance, decreasing = TRUE), 
+         ]
+      
+      # Add a rank column
+      ranked_coords$rank <- 1:nrow(ranked_coords)
+      
+      return(ranked_coords)
+   }
+
+
+
+
+```
+
+```{r}
+coord_rank <- 
+   
+   function(x, y, center_x, center_y, max_x_distance = 2, min_y_distance = 4) {
+      
+      # Compute absolute distances from the center point
+      x_distance <- abs(x - center_x)
+      y_distance <- abs(y - center_y)
+      
+      # flags for if a coord is eligible for ranking
+      x_check <- x_distance <= max_x_distance
+      y_check <- y_distance >= min_y_distance
+      xy_check <- x_check * y_check
+      
+      # Check if the point meets the distance criteria
+      if (xy_check == 1) {
+         # Return the ranking based on y_distance
+         return(rank(desc(y_distance), ties.method = "first"))
+      } 
+      else {
+         # Return NA for points not meeting the criteria
+         return(NA_integer_)
+      } 
+      
+   }
+```
+
+```{r}
+# determine who the center is on a play
+determine_center_player <- function(df_tracking, df_plays) {
+   
+   coords_at_snap <- 
+      df_tracking |> 
+      # filter(frameTypeInt == 0) |>
+      filter(event == "line_set") |> 
+      distinct(gameId, playId, club, nflId, displayName, frameId, event, x, y)
+   
+   team_sides <- 
+      df_plays |> 
+      distinct(gameId, playId, possessionTeam, defensiveTeam)
+   
+   coords_sides <- 
+      coords_at_snap |> 
+      inner_join(team_sides, by = join_by(gameId, playId)) |> 
+      mutate(clubSide = case_when(club == possessionTeam ~ "OFF",
+                                  club == defensiveTeam ~ "DEF",
+                                  club == "football" ~ "FB",
+                                  TRUE ~ "ERR"))
+   
+   fb_xy <- 
+      coords_at_snap |> 
+      filter(club == "football") |> 
+      select(gameId, playId, x_fb = x, y_fb = y)
+   
+   offense_xy <- 
+      coords_sides |> 
+      filter(clubSide == "OFF") |> 
+      left_join(fb_xy) |> 
+      mutate(dist_to_fb = calculate_distance(x, x_fb, y, y_fb))
+   
+   offense_xy |> 
+      arrange(gameId, playId, dist_to_fb) |> 
+      group_by(gameId, playId) |> 
+      slice_head(n = 1) |> 
+      ungroup() |> 
+      select(gameId, playId, 
+             nflId_center = nflId, 
+             name_center = displayName,
+             x_C = x, 
+             y_C = y,
+             x_fb,
+             y_fb,
+             dist_to_fb)
+   
+}
+```
