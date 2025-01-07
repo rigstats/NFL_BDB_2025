@@ -5,11 +5,9 @@
 
 # Libraries ####
 
-library(dplyr)
-library(ggplot2)
+library(tidyverse)
 library(nflplotR)
 library(nflreadr)
-library(gganimate)
 
 
 # Data ####
@@ -79,47 +77,103 @@ if (file.exists('./input/nflverse_joined.rds')) {
    
 } else {
    
-   nflv_participation <-
+   # full PBP
+   nflv_pbp <- 
+      nflreadr::load_pbp(seasons = 2022) |> 
+      tibble() |> 
+      filter(week <= 9) |> 
+      mutate(gameId = as.integer(old_game_id),
+             playId = as.integer(play_id)) |> 
+      select(week, 
+             gameId,
+             playId,
+             game_id,
+             posteam, 
+             defteam, 
+             posteam_score, 
+             defteam_score, 
+             score_differential, 
+             down, 
+             ydstogo,
+             yardline_100,
+             qtr,
+             desc, 
+             half_seconds_remaining,
+             posteam_timeouts_remaining,
+             defteam_timeouts_remaining,
+             play_type,
+             pass,
+             rush,
+             yards_gained, 
+             success, 
+             pass_length, 
+             pass_location, 
+             air_yards,
+             yac = yards_after_catch,
+             run_location, 
+             run_gap, 
+             ep,
+             epa,
+             air_epa,
+             yac_epa,
+             wp,
+             wpa,
+             passer_player_id:rushing_yards,
+             xpass,
+             pass_oe,
+             cp,
+             cpoe,
+             series, series_success, series_result, 
+             fixed_drive, fixed_drive_result, 
+             drive_play_count, drive_time_of_possession, 
+             drive_first_downs, drive_ended_with_score, 
+             drive_start_transition, drive_end_transition)
+   
+   
+   # FTN charting
+   nflv_ftn <- 
+      nflreadr::load_ftn_charting(seasons = 2022) |>  
+      tibble() |> 
+      filter(week <= 9) |> 
+      select(week, 
+             game_id = nflverse_game_id,
+             playId = nflverse_play_id,
+             starting_hash,
+             qb_location,
+             read_thrown,
+             starts_with("n_"),
+             starts_with("is_")) |> 
+      mutate(across(.cols = where(is.logical),
+                    .fns = function(x) as.integer(x)))
+   
+   # Participation (personnel, formations, ...)
+   nflv_participation <- 
       nflreadr::load_participation(seasons = 2022) |> 
-      tibble()
+      tibble() |> 
+      filter(nflverse_game_id %in% unique(nflv_ftn$game_id),
+             possession_team != "") |> 
+      mutate(gameId = as.integer(old_game_id)) |> 
+      select(game_id = nflverse_game_id,
+             gameId,
+             playId = play_id,
+             posteam = possession_team,
+             personnelOff = offense_personnel,
+             personnelDef = defense_personnel,
+             manZone = defense_man_zone_type,
+             coverageType = defense_coverage_type,
+             # air_yards = ngs_air_yards,
+             time_to_throw,
+             route,
+             was_pressure)
    
-   nflv_ftn <-
-      nflreadr::load_ftn_charting(seasons = 2022) |> 
-      filter(week <= 9) |> 
-      tibble()
+   nflverse_joined <- 
+      nflv_pbp |> 
+      inner_join(nflv_ftn, by = join_by(week, playId, game_id)) |> 
+      inner_join(nflv_participation, by = join_by(gameId, playId, game_id, posteam)) |> 
+      arrange(week, gameId, playId)
    
-   nflv_pbp <-
-      nflreadr::load_pbp(seasons = 2022) |>
-      filter(week <= 9) |> 
-      tibble()
    
-   nflverse_joined <-
-      nflv_ftn |> 
-      rename(play_id = nflverse_play_id) |> 
-      select(-ftn_game_id, -ftn_play_id, -date_pulled, -season) |>
-      inner_join(nflv_participation, 
-                 by = join_by(nflverse_game_id, play_id)) |>
-      inner_join(nflv_pbp |> 
-                    select(nflverse_game_id = game_id, 
-                           old_game_id, 
-                           play_id,
-                           play_type, pass, rush,
-                           pass_length, pass_location, air_yards,
-                           run_location, run_gap,
-                           posteam, defteam,
-                           success, yardline_100,
-                           posteam_score, defteam_score, score_differential,
-                           xpass, pass_oe, cp, cpoe,
-                           game_half, 
-                           game_seconds_remaining, half_seconds_remaining,
-                           posteam_timeouts_remaining, 
-                           defteam_timeouts_remaining,
-                           wp, wpa),
-                 by = join_by(old_game_id, nflverse_game_id, play_id)) |> 
-      relocate(week, old_game_id, nflverse_game_id, play_id)
-   
-   saveRDS(nflverse_joined, "./input/nflverse_joined.rds")
-   # readr::write_csv(nflv_join, "./input/nflverse_joined.csv")
+   saveRDS(nflverse_joined, file = "./input/nflverse_joined.rds")
    
 }
 

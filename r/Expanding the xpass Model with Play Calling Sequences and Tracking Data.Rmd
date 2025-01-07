@@ -17,6 +17,12 @@ at varying levels-of-detail (LODs):
 
 # Setup
 
+Load in datasets
+
+```{r}
+source("./r/01_load_data.R")
+```
+
 ## Libraries
 
 ```{r message=FALSE, warning=FALSE}
@@ -25,7 +31,7 @@ library(tidyverse)
 
 ## Data
 
-### Raw Input
+### Raw and Pre-processed Input
 
 ```{r message=FALSE, warning=FALSE}
 # non-tracking data
@@ -36,55 +42,437 @@ player_play <- readr::read_csv('./input/player_play.csv')
 
 # nflverse data
 nflverse_joined <- readr::read_tsv("./input/nflverse_joined.tsv")
+
+# modeling dataset
+model_data <- readr::read_csv('./input/model_data.csv')
+```
+
+# Model
+
+Load in the pre-processed dataset
+
+```{r}
+model_data
+```
+
+Save a copy of the non-feature columns (week, gameId, playId, frameId,
+possessionTeam, label) for joining back in later
+
+```{r}
+non_feature_data <- 
+   model_data |> 
+   select(week, gameId, playId, frameId, possessionTeam, label) |> 
+   mutate(rowId = row_number())
+```
+
+Minor data cleaning before passing into a model
+
+```{r}
+# only keep the presnap versions of the cumulative count columns
+model_data_01 <-
+   model_data |> 
+   mutate(n_plays = pre_pass + pre_rush) |> 
+   mutate(presnap_pass_rt = pre_pass / (pre_rush + pre_pass),
+          presnap_success_rt = pre_success / n_plays) |> 
+   select(-success, -pass_success, -rush_success, 
+          -contains("csum"),
+          -offenseFormation,
+          -pre_pass,
+          -pre_success,
+          -pre_rush,
+          -pre_pass_success,
+          -pre_rush_success,
+          -pre_success_prop_rush) |> 
+   select(-matches(names(non_feature_data)))
 ```
 
 ```{r}
-# tracking data - week 1 only at first
-gameId_week_01 <- games |> filter(week == 1) |> pull(gameId)
-
-tracking <- 
-   arrow::read_parquet("./input/tracking_union_mod.parquet") |> 
-   filter(gameId %in% gameId_week_01)
+# distinct version to prevent overfitting from using same play multiple times
+model_data_01_d <-
+   non_feature_data |> 
+   bind_cols(model_data_01) |> 
+   mutate(
+      across(
+         .cols = c(RB_min_x, QB_min_x, TE_min_abs_y),
+         .fns = function(x) round(x, digits = 0))) |> 
+   select(-frameId, -rowId) |> 
+   distinct()
 ```
 
 ```{r}
-head(tracking)
-```
-
-Trim the tracking data for smaller memory footprint
-
-```{r}
-tracking$playDirection <- NULL
-tracking$frameType <- NULL
+non_feature_data_d <-
+   model_data_01_d |> 
+   select(week, gameId, playId, possessionTeam, label) |> 
+   mutate(rowId = row_number())
 ```
 
 ```{r}
-# presnap frames only
-tracking <- tracking |> filter(frameTypeInt < 1)
+model_data_y_labels_d <- non_feature_data_d$label 
+
+train_row_ids_d <- which(non_feature_data_d$week <= 8)
+test_row_ids_d <- which(non_feature_data_d$week == 9)
 ```
 
 ```{r}
-# only keep plays that have a "line_set" event, then only keep frames between 
-# line_set and the snap
-tracking <- 
-   tracking |> 
-   group_by(gameId, playId) |> 
-   filter(sum(event == "line_set", na.rm = T) != 0, 
-          sum(event %in% c("ball_snap", "snap_direct"), na.rm = T) != 0) |> 
-   mutate(frameIdLineSet = min(frameId[event == "line_set"], na.rm = T)) |> 
+model_data_scaled_d <- 
+   scale(
+      as.matrix(
+         model_data_01_d |> 
+            select(-matches(names(non_feature_data_d)))))
+```
+
+```{r}
+X_train_d <- model_data_scaled_d[train_row_ids_d, ]
+X_test_d <- model_data_scaled_d[test_row_ids_d, ]
+
+y_train_d <- model_data_y_labels_d[train_row_ids_d]
+y_test_d <- model_data_y_labels_d[test_row_ids_d]
+
+scale_pos_weight_d <- sum(y_train_d == 0) / sum(y_train_d == 1)
+```
+
+```{r}
+# Initialize and Train XGBoost Model
+xgb_params_d <- list(
+   objective = "binary:logistic",
+   scale_pos_weight = scale_pos_weight_d,
+   reg_lambda = 300
+) 
+```
+
+```{r message=FALSE, warning=FALSE}
+model_d <- xgboost::xgboost(data = X_train_d,
+                            label = y_train_d,
+                            params = xgb_params_d,
+                            nrounds = 100)
+```
+
+```{r}
+# Feature Importance
+importance_d <- xgboost::xgb.importance(model = model_d) 
+
+feature_importance_df_d <- 
+   as_tibble(importance_d) |> 
+   arrange(desc(Gain)) 
+```
+
+```{r}
+# Model Evaluation
+y_pred_d <- predict(model_d, X_test_d) |> round() 
+
+conf_matrix_d <- caret::confusionMatrix(factor(y_pred_d), factor(y_test_d))
+```
+
+```{r}
+# K-Fold Validation
+set.seed(904) 
+
+folds_d <- caret::createFolds(model_data_y_labels_d, k = 10) 
+
+cv_scores_d <- purrr::map_dbl(folds_d, function(test_indices) {
+   
+   train_indices <- setdiff(seq_along(model_data_y_labels_d), test_indices)
+   
+   model_cv <- xgboost::xgboost(data = model_data_scaled_d[train_indices,],
+                                label = model_data_y_labels_d[train_indices],
+                                params = xgb_params_d,
+                                nrounds = 100,
+                                verbose = 0)
+   
+   pred <- predict(model_cv, model_data_scaled_d[test_indices,]) |> round()
+   
+   mean(pred == model_data_y_labels_d[test_indices])
+   
+})
+```
+
+```{r}
+y_train_pred_d <- predict(model_d, X_train_d) 
+
+y_test_pred_d <- predict(model_d, X_test_d) 
+```
+
+```{r}
+roc_train_d <- pROC::roc(y_train_d, y_train_pred_d) 
+roc_test_d <- pROC::roc(y_test_d, y_test_pred_d) 
+```
+
+## Model Comparison
+
+Create predictions on entire dataset
+
+```{r}
+model_predictions <- predict(model_d, model_data_scaled_d)
+```
+
+Compare to original xPass model
+
+```{r}
+xPass_comparison_df <- 
+   tibble(gameId = model_data_01_d$gameId,
+          playId = model_data_01_d$playId,
+          pPass = model_predictions,
+          predicted = round(model_predictions),
+          actual = model_data_y_labels_d
+   ) %>%
+   inner_join(nflverse_joined |> 
+                 select(gameId, 
+                        playId, 
+                        team = posteam, 
+                        xPass = xpass,
+                        pass_OE = pass_oe)) |> 
+   mutate(predictedOG = round(xPass)) |> 
+   mutate(
+      modelCorrect = ifelse(actual == predicted, 1, 0),
+      modelCorrectOG = ifelse(actual == predictedOG, 1, 0),
+      predictionDiff = pPass - xPass
+   ) |> 
+   relocate(gameId, playId, team, pPass, xPass, predictionDiff, 
+            predicted, predictedOG, actual,
+            modelCorrect, modelCorrectOG)
+
+xPass_comparison_df <- 
+   xPass_comparison_df |> 
+   mutate(bestModel = 
+             case_when(
+                modelCorrect > modelCorrectOG ~ "new", 
+                modelCorrect < modelCorrectOG ~ "OG",
+                modelCorrect == modelCorrectOG & 
+                   actual == 1 &
+                   pPass > xPass ~ "new",
+                modelCorrect == modelCorrectOG & 
+                   actual == 1 &
+                   pPass < xPass ~ "OG",
+                modelCorrect == modelCorrectOG & 
+                   actual == 0 &
+                   pPass < xPass ~ "new",
+                modelCorrect == modelCorrectOG & 
+                   actual == 0 &
+                   pPass > xPass ~ "OG",
+                TRUE ~ "other")) |> 
+   mutate(bestModelAmount = abs(predictionDiff)) |> 
+   mutate(across(.cols = c(predicted, predictedOG, actual),
+                 .fns = function(x) ifelse(x == 0, "rush", "pass"),
+                 .names = "{.col}_fct")) |> 
+   inner_join(nflverse_joined |> 
+                 select(gameId, playId, defteam, 
+                        score_differential, down, 
+                        qtr, ydstogo, epa, wp, wpa, 
+                        half_seconds_remaining, 
+                        distanceToGoal = yardline_100)) |> 
+   inner_join(plays |> 
+                 select(gameId, playId, offenseFormation))
+```
+
+```{r}
+# dataset with model predictions for all frames
+preds_all_frames <- 
+   model_data_01 |> 
+    bind_cols(non_feature_data) |> 
+    mutate(across(.cols = c(RB_min_x, QB_min_x, TE_min_abs_y),
+                  .fns = function(x) round(x, digits = 0))) |> 
+    left_join(model_data_01_d |> mutate(pPass = model_predictions),
+              by = join_by(xpass, 
+                           OL_count, 
+                           QB_count, 
+                           RB_count, 
+                           TE_count, 
+                           WR_count, 
+                           RB_min_x, QB_min_x, TE_min_abs_y, 
+                           n_plays, 
+                           pre_pass_success_rt, 
+                           pre_success_prop_pass, 
+                           pre_rush_success_rt, 
+                           presnap_pass_rt, 
+                           presnap_success_rt, 
+                           week, 
+                           gameId, 
+                           playId, 
+                           possessionTeam,
+                           label))
+```
+
+```{r}
+# save result
+readr::write_csv(preds_all_frames, "./input/predictions_all_frames.csv")
+```
+
+Join results together, only keep final prediction
+
+```{r}
+preds_final_frames_joined <- 
+   preds_all_frames |> 
+   rename(team = possessionTeam,
+          xPass = xpass) |> 
+   mutate(xPass = round(xPass, digits = 4)) |> 
+   select(-frameId, -rowId) |> 
+   distinct() |> 
+   group_by(gameId, playId, team, label) |> 
+   slice_tail(n = 1) |> 
    ungroup() |> 
-   filter(frameId >= frameIdLineSet) |> 
-   select(-frameIdLineSet) |> 
-   arrange(gameId, playId, club, nflId, frameId)
+   inner_join(
+      xPass_comparison_df |> 
+         rename(label = actual) |> 
+         mutate(xPass = round(xPass, digits = 4)) |> 
+         group_by(gameId, playId, team, label) |> 
+         slice_tail(n = 1) |> 
+         ungroup()
+      ) |> 
+   relocate(week, gameId, playId, team, label, pPass, xPass) |> 
+   arrange(week, gameId, playId)
 ```
 
-## Functions
+```{r}
+preds_final_frames_joined
+```
+
+# Deprecated
+
+## Original Model (deprecated)
+
+```{r}
+model_data_y_labels <- model_data$label
+
+train_row_ids <- which(model_data$week <= 8)
+test_row_ids <- which(model_data$week == 9)
+```
+
+```{r}
+X_train <- model_data_scaled[train_row_ids, ]
+X_test <- model_data_scaled[test_row_ids, ]
+
+y_train <- model_data_y_labels[train_row_ids]
+y_test <- model_data_y_labels[test_row_ids]
+
+scale_pos_weight <- sum(y_train == 0) / sum(y_train == 1)
+```
+
+Scale the predictors and then store as matrix in order to use in xgboost
+
+```{r}
+model_data_scaled <- scale(as.matrix(model_data_01))
+#colnames(model_data_scaled) <- colnames(model_data_01)
+
+```
+
+```{r}
+X_train <- model_data_scaled[train_row_ids, ]
+X_test <- model_data_scaled[test_row_ids, ]
+
+y_train <- model_data_y_labels[train_row_ids]
+y_test <- model_data_y_labels[test_row_ids]
+
+scale_pos_weight <- sum(y_train == 0) / sum(y_train == 1)
+```
+
+```{r}
+# Initialize and Train XGBoost Model
+xgb_params <- list(
+   objective = "binary:logistic",
+   scale_pos_weight = scale_pos_weight,
+   reg_lambda = 300
+)
+```
+
+```{r}
+
+model <- xgboost(data = X_train,
+                 label = y_train,
+                 params = xgb_params,
+                 nrounds = 100)
+```
+
+### Evaluate
+
+```{r}
+# Feature Importance
+importance <- xgb.importance(model = model)
+
+feature_importance_df <- 
+   as_tibble(importance) %>%
+   arrange(desc(Gain))
+```
+
+```{r}
+feature_importance_df
+```
+
+```{r}
+# Model Evaluation
+y_pred <- predict(model, X_test) %>% round()
+
+conf_matrix <- caret::confusionMatrix(factor(y_pred), factor(y_test))
+```
+
+```{r}
+# K-Fold Validation
+set.seed(904)
+
+folds <- caret::createFolds(model_data_y_labels, k = 10)
+
+cv_scores <- map_dbl(folds, function(test_indices) {
+   
+   train_indices <- setdiff(seq_along(model_data_y_labels), test_indices)
+   
+   model_cv <- xgboost(data = model_data_scaled[train_indices,],
+                       label = model_data_y_labels[train_indices],
+                       params = xgb_params,
+                       nrounds = 100,
+                       verbose = 0)
+   
+   pred <- predict(model_cv, model_data_scaled[test_indices,]) %>% round()
+   
+   mean(pred == model_data_y_labels[test_indices])
+   
+})
+
+```
+
+```{r}
+y_train_pred <- predict(model, X_train)
+
+y_test_pred <- predict(model, X_test)
+```
+
+```{r}
+roc_train <- pROC::roc(y_train, y_train_pred)
+roc_test <- pROC::roc(y_test, y_test_pred)
+```
+
+## Functions (deprecated)
+
+```{r}
+# extracts position numbers from nflverse personnel columns
+extract_personnel_count <- function(string, pos_name, default_NA = 0L) {
+
+   # regex pattern to match a digit preceding the string pos_name
+   p <- paste0("\\d[ ]", pos_name)
+
+
+   # extracts the digit as a numeric value
+   res <-
+      as.numeric(
+         stringr::str_extract(
+            string = stringr::str_extract(string = string, pattern = p),
+            pattern = "\\d")
+      )
+
+
+   # replace NA (no matching pos_name) with default
+   # ret <- ifelse(is.na(res), default_NA, res)
+   ret <- tidyr::replace_na(res, default_NA)
+
+
+   return(ret)
+
+}
+```
 
 ```{r}
 # basic euclidean distance
 calculate_distance <- 
    
-   function(x1, x2, y1, y2) { 
+   function(x1, y1, x2, y2) { 
       
       dx = x1 - x2
       
@@ -96,128 +484,351 @@ calculate_distance <-
 ```
 
 ```{r}
-# ranks coordinates based on distance from the center point
-# with additional filtering for minimum x and y distances
-rank_coordinates <- 
+find_kth_closest <- function(data, point_x, point_y, k) {
    
-   function(coordinates, center, min_x_distance = 0, min_y_distance = 0) {
-      
-      # Validate input
-      if (nrow(coordinates) == 0) {
-         
-         stop("Coordinates dataframe is empty")
-         
-      }
-      
-      # Compute absolute distances from the center point
-      coordinates$x_distance <- abs(coordinates$x - center$x)
-      coordinates$y_distance <- abs(coordinates$y - center$y)
-      
-      # Filter coordinates based on minimum distance thresholds
-      filtered_coords <- 
-         coordinates[
-            coordinates$x_distance >= min_x_distance & 
-               coordinates$y_distance >= min_y_distance, 
-         ]
-      
-      # If no coordinates meet the distance criteria, return an empty dataframe
-      if (nrow(filtered_coords) == 0) {
-         
-         warning("No coordinates meet the minimum distance criteria")
-         return(data.frame())
-         
-      }
-      
-      # Sort by y_distance in descending order to rank from outside-in
-      ranked_coords <- 
-         filtered_coords[
-            order(filtered_coords$y_distance, decreasing = TRUE), 
-         ]
-      
-      # Add a rank column
-      ranked_coords$rank <- 1:nrow(ranked_coords)
-      
-      return(ranked_coords)
-   }
-
-
-
-
+  # Input validation
+  if (!all(c("nflId", "x", "y") %in% colnames(data))) {
+    stop("Data frame must contain columns: 'nflId', 'x', and 'y'")
+  }
+  
+  if (!is.numeric(point_x) || !is.numeric(point_y)) {
+    stop("point_x and point_y must be numeric values")
+  }
+  
+  if (!is.numeric(k) || k < 1 || k > nrow(data)) {
+    stop("k must be a positive integer not exceeding the number of points in the dataset")
+  }
+   
+  
+  # Calculate distances from the given point to all points in the dataset
+  result <- 
+     data |> 
+     mutate(
+        distance = calculate_distance(point_x, point_y, x, y)
+        ) |> 
+     arrange(distance) |> 
+     slice(k)  # Select the k'th closest point
+    
+  return(result)
+  
+}
 ```
 
 ```{r}
-coord_rank <- 
+# trim excess frames from tracking data
+trim_tracking_frames <- 
    
-   function(x, y, center_x, center_y, max_x_distance = 2, min_y_distance = 4) {
+   function(df_tracking, 
+            start_events = c("line_set", "man_in_motion"), 
+            end_events = c("ball_snap",
+                           "autoevent_ballsnap",
+                           "snap_direct"),
+            keep_cols = TRUE) {
       
-      # Compute absolute distances from the center point
-      x_distance <- abs(x - center_x)
-      y_distance <- abs(y - center_y)
+      start_frames <- 
+         df_tracking |> 
+         distinct(gameId, playId, frameId, event) |> 
+         group_by(gameId, playId) |> 
+         filter(sum(event %in% start_events, na.rm = T) > 0) |> 
+         filter(sum(event %in% end_events, na.rm = T) > 0) |> 
+         mutate(frameIdStart = min(frameId[event %in% start_events], na.rm = T),
+                frameIdEnd = max(frameId[event %in% end_events], na.rm = T)) |> 
+         ungroup() |> 
+         distinct(gameId, playId, frameIdStart, frameIdEnd)
       
-      # flags for if a coord is eligible for ranking
-      x_check <- x_distance <= max_x_distance
-      y_check <- y_distance >= min_y_distance
-      xy_check <- x_check * y_check
       
-      # Check if the point meets the distance criteria
-      if (xy_check == 1) {
-         # Return the ranking based on y_distance
-         return(rank(desc(y_distance), ties.method = "first"))
+      trimmed_tracking <- 
+         df_tracking |> 
+         inner_join(start_frames, by = join_by(gameId, playId)) |> 
+         filter(frameId >= frameIdStart,
+                frameId <= frameIdEnd) 
+      
+      if (keep_cols == FALSE) {
+         
+         trimmed_tracking$frameIdStart <- NULL
+         trimmed_tracking$frameIdEnd <- NULL
+         
       } 
-      else {
-         # Return NA for points not meeting the criteria
-         return(NA_integer_)
-      } 
+      
+      return(trimmed_tracking)
       
    }
 ```
 
 ```{r}
 # determine who the center is on a play
-determine_center_player <- function(df_tracking, df_plays) {
+determine_center_player2 <- 
+   
+   function(df_tracking, 
+            df_plays = plays, 
+            df_players = players, 
+            snapFrameOffset = NULL) {
+   
+   # player positions to exclude from being classified as the center
+   ineligible_players <- 
+      df_players |> 
+      filter(position %in% c("QB","WR","RB","FB","TE")) |> 
+      distinct(nflId, displayName, position)
+   
    
    coords_at_snap <- 
       df_tracking |> 
-      # filter(frameTypeInt == 0) |>
-      filter(event == "line_set") |> 
+      trim_tracking_frames() |> 
       distinct(gameId, playId, club, nflId, displayName, frameId, event, x, y)
+   
+   
+   fb_xy <- 
+      coords_at_snap |> 
+      filter(club == "football") |> 
+      select(gameId, playId, frameId, x_fb = x, y_fb = y)
+   
    
    team_sides <- 
       df_plays |> 
       distinct(gameId, playId, possessionTeam, defensiveTeam)
    
-   coords_sides <- 
+   
+   coords_at_snap <- 
       coords_at_snap |> 
-      inner_join(team_sides, by = join_by(gameId, playId)) |> 
+      filter(club != "football") |> 
+      left_join(fb_xy, 
+                 by = join_by(gameId, playId, frameId)) |> 
+      left_join(team_sides, 
+                 by = join_by(gameId, playId)) |> 
       mutate(clubSide = case_when(club == possessionTeam ~ "OFF",
                                   club == defensiveTeam ~ "DEF",
                                   club == "football" ~ "FB",
                                   TRUE ~ "ERR"))
    
-   fb_xy <- 
-      coords_at_snap |> 
-      filter(club == "football") |> 
-      select(gameId, playId, x_fb = x, y_fb = y)
    
-   offense_xy <- 
-      coords_sides |> 
+   coords_at_snap |> 
+      mutate(dist_to_fb = calculate_distance(x, y, x_fb, y_fb)) |> 
       filter(clubSide == "OFF") |> 
-      left_join(fb_xy) |> 
-      mutate(dist_to_fb = calculate_distance(x, x_fb, y, y_fb))
-   
-   offense_xy |> 
+      anti_join(ineligible_players, by = join_by(nflId)) |> 
       arrange(gameId, playId, dist_to_fb) |> 
-      group_by(gameId, playId) |> 
+      group_by(gameId, playId, frameId) |> 
       slice_head(n = 1) |> 
-      ungroup() |> 
-      select(gameId, playId, 
-             nflId_center = nflId, 
-             name_center = displayName,
-             x_C = x, 
-             y_C = y,
-             x_fb,
-             y_fb,
-             dist_to_fb)
+      ungroup()
    
 }
+```
+
+```{r}
+determine_linemen <- 
+   
+   function(df_tracking, 
+            df_plays = plays, 
+            df_players = players) {
+   
+   tracking_center <- 
+      df_tracking |> 
+      determine_center_player2(df_plays = plays, df_players = players) |> 
+      select(gameId, 
+             playId, 
+             frameId, 
+             event, 
+             club, 
+             nflId_C = nflId, 
+             displayName_C = displayName, 
+             x_C = x, 
+             y_C = y) #|> mutate(position = "C")
+   
+   
+   df_players <- df_players |> distinct(nflId, displayName, position)
+   
+   # player positions to exclude from being classified as linemen
+   ineligible_players <- 
+      df_players |> 
+      filter(position %in% c("QB","WR","RB","FB","TE")) |> 
+      distinct(nflId)
+   
+   # tracking of "eligible" players only aka OL
+   tracking_OL <- 
+      df_tracking |> 
+      inner_join(tracking_center) |> 
+      filter(nflId_C != nflId) |> 
+      #inner_join(df_tracking, by = join_by(gameId, playId, frameId, event, club)) |> 
+      anti_join(ineligible_players, by = join_by(nflId)) |> 
+      select(gameId, 
+             playId, 
+             frameId, 
+             event, 
+             club, 
+             nflId, 
+             displayName, 
+             x,
+             y,
+             x_C,
+             y_C) |> 
+      arrange(gameId, 
+              playId, 
+              club,
+              frameId, 
+              nflId)
+   
+   # add helpers to determine on-field position
+   res <- 
+      tracking_OL |> 
+      mutate(sideOfC = ifelse(y > y_C, "L", "R")) |> 
+      mutate(distToC = calculate_distance(x, y, x_C, y_C)) |> 
+      arrange(gameId, playId, frameId, sideOfC, distToC) |> 
+      group_by(gameId, playId, frameId, club, sideOfC) |> 
+      mutate(distRank = seq_along(nflId)) |> 
+      ungroup()
+   
+   
+   return(res)
+   
+   
+}
+```
+
+Test metric - squared horizontal distance from the LT and RTs. If summed up
+all players values on a play, then higher values should imply higher xPass?
+
+```{r}
+widths_from_tackles <- 
+   
+   function(df_tracking, 
+            df_plays = plays, 
+            df_players = players,
+            buffer_distance = 0) {
+      
+      y_bounds <- 
+         df_tracking |> 
+         determine_linemen() |> 
+         filter(distRank == 2) |> 
+         group_by(gameId,playId,frameId,event,club) |> 
+         summarise(y_RT = min(y, na.rm = T),
+                   y_LT = max(y, na.rm = T)) |> 
+         ungroup() |> 
+         mutate(y_RTo = y_RT - buffer_distance,
+                y_LTo = y_LT + buffer_distance)
+      
+      tracking_outside_of_y <- 
+         df_tracking |> 
+         inner_join(y_bounds, by = join_by(gameId,playId,frameId,event,club)) |> 
+         mutate(isOutsideTackles = case_when(y < y_RTo ~ "OUTSIDE",
+                                             y <= y_LTo ~ "INSIDE",
+                                             y > y_LTo ~ "OUTSIDE",
+                                             TRUE ~ "ERR")) |> 
+         mutate(dy2 = case_when(isOutsideTackles == "INSIDE" ~ 0,
+                                y < y_RTo ~ (y_RT - y)^2,
+                                y > y_LTo ~ (y - y_LT)^2,
+                                TRUE ~ NA_real_))
+         #filter(isOutsideTackles == "OUTSIDE")
+         #filter(y < y_RT | y > y_LT)
+      
+      return(tracking_outside_of_y)
+      
+   }
+```
+
+```{r}
+determine_position_from_alignment <- 
+   
+   function(df_tracking, df_plays = plays, df_players = players) {
+      
+      
+      center_info <- 
+         df_tracking |> 
+         determine_center_player2(df_plays = df_plays, df_players = df_players) |> 
+         select(gameId, playId, club, frameId, x_c = x, y_c = y)
+      
+      
+      joined_tracking <- 
+         df_tracking |> 
+         inner_join(center_info, by = join_by(gameId, playId, frameId, club)) |> 
+         relocate(gameId, 
+                  playId, 
+                  club, 
+                  nflId, 
+                  displayName, 
+                  frameId, 
+                  x, 
+                  y, 
+                  x_c, 
+                  y_c)
+      
+      
+      joined_tracking$dx <- joined_tracking$x - joined_tracking$x_c
+      joined_tracking$dy <- joined_tracking$y - joined_tracking$y_c
+      
+      
+      joined_tracking |> 
+         
+         mutate(sideOfCenter = 
+                   case_when(abs(dy) <= 1 ~ "C",
+                             dy > 0 ~ "L", 
+                             dy < 0 ~ "R",
+                             TRUE ~ NA_character_)) |> 
+         
+         mutate(widthLevel = 
+                   case_when(
+                      sideOfCenter == "C" ~ "C",
+                      abs(dy) <= 4.5 ~ "BOX",
+                      abs(dy) > 4.5 ~ "WIDE",
+                      TRUE ~ "OTHER"
+                   )
+         ) |> 
+         
+         mutate(depthFromCenter = 
+                   case_when(
+                      # begin with labeling the center, QB, and RBs (if any)
+                      dx == 0 & dy == 0 ~ "C",
+                      abs(dy) <= 1 & abs(dx) <= 1.5 ~ "UNDER_CENTER",
+                      abs(dy) <= 1 & abs(dx) > 1.5 ~ "BACKFIELD",
+                      # then label players in the box (OL)
+                      abs(dy) <= 3.5 & abs(dx) <= 1.5 ~ "OL",
+                      # then eligible receivers
+                      abs(dy) > 3.5 ~ "REC",
+                      TRUE ~ "OTHER"
+                   )
+         ) |> 
+         
+         arrange(gameId, 
+                 playId, 
+                 frameId, 
+                 sideOfCenter, 
+                 depthFromCenter, 
+                 desc(abs(dy))) |> 
+         
+         group_by(gameId, 
+                  playId, 
+                  frameId,
+                  sideOfCenter, 
+                  depthFromCenter) |> 
+         
+         mutate(alignmentNum = ifelse(sideOfCenter == "C", 
+                                      0L, 
+                                      seq_along(nflId))) |> 
+         ungroup()
+   
+
+}
+```
+
+Example usage:
+
+```{r}
+tracking |> 
+    filter(gameId == 2022091200, playId == 315) |> 
+    determine_position_from_alignment() |> 
+    arrange(gameId, playId, club, nflId, frameId) |> 
+    filter(frameId %in% seq(170, 200, 5)) |> 
+    group_by(gameId, playId, frameId) |> 
+   mutate(
+      n_backfield = sum(depthFromCenter == "BACKFIELD", na.rm = TRUE),
+      n_wide_eligible = 
+         sum(depthFromCenter == "REC" & widthLevel == "WIDE", na.rm = TRUE),
+      n_box_eligible = 
+         sum(depthFromCenter == "REC" & widthLevel == "BOX", na.rm = TRUE)) |> 
+    add_count(depthFromCenter, name = "n_depth") |> 
+    add_count(widthLevel, name = "n_width") |> 
+    ungroup() |> 
+    arrange(gameId, playId, club, frameId, depthFromCenter, widthLevel, dy) |> 
+   relocate(gameId, playId, frameId, nflId, displayName, jerseyNumber,
+            x, y, dx, dy, 
+            sideOfCenter:alignmentNum,
+            starts_with("n_"))
 ```
